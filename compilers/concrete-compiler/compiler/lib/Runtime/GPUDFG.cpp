@@ -20,6 +20,7 @@
 
 #include <concretelang/Runtime/stream_emulator_api.h>
 #include <concretelang/Runtime/wrappers.h>
+#include "concretelang/Runtime/time_util.h"
 
 #ifdef CONCRETELANG_CUDA_SUPPORT
 #include "bootstrap.h"
@@ -33,6 +34,10 @@ namespace mlir {
 namespace concretelang {
 namespace gpu_dfg {
 namespace {
+
+#if CONCRETELANG_TIMING_ENABLED
+  static struct timespec merge_timer, cpu_timer, move_timer;
+#endif
 
 using MemRef2 = MemRefDescriptor<2>;
 
@@ -333,52 +338,20 @@ struct Dependence {
   }
   void merge_dependence(GPU_DFG *dfg) {
     assert(!chunks.empty() && "Cannot merge dependence with no chunks");
-    size_t data_size = 0;
-    size_t num_samples = 0;
-    for (auto c : chunks) {
-      data_size += memref_get_data_size(c->host_data);
-      num_samples += c->host_data.sizes[0];
-    }
-    uint64_t *data = (uint64_t *)malloc(data_size);
-    MemRef2 output = {data,
-                      data,
-                      0,
-                      {num_samples, chunks.front()->host_data.sizes[1]},
-                      {chunks.front()->host_data.sizes[1], 1}};
+    BEGIN_TIME(&merge_timer);
+    assert(host_data.allocated != nullptr);
 
-    std::list<cudaStream_t *> custreams_used;
-    for (auto c : chunks) {
-      // Write out the piece in the final target dependence
-      size_t csize = memref_get_data_size(c->host_data);
-      if (c->onHostReady) {
-        memcpy(((char *)output.aligned) + output.offset, c->host_data.aligned,
-               csize);
-      } else {
-        assert(c->location > host_location);
-        cudaStream_t *s = (cudaStream_t *)dfg->get_gpu_stream(c->location);
-        cuda_memcpy_async_to_cpu(((char *)output.aligned) + output.offset,
-                                 c->device_data, csize, s, c->location);
-        custreams_used.push_back(s);
-      }
-      output.offset += csize;
-    }
-    output.offset = 0;
-    for (auto c : chunks)
-      c->free_data(dfg, true);
+    //for (auto c : chunks)
+    //c->free_data(dfg, true);
     chunks.clear();
-
-    custreams_used.sort();
-    custreams_used.unique();
-    for (auto s : custreams_used)
-      cudaStreamSynchronize(*s);
 
     location = host_location;
     onHostReady = true;
-    assert(host_data.allocated == nullptr);
-    host_data = output;
+    //assert(host_data.allocated == nullptr);
     assert(device_data == nullptr);
     hostAllocated = true;
     chunk_id = single_chunk;
+    END_TIME(&merge_timer, "Merging :");
   }
   void move_chunk_off_device(int32_t chunk_id, GPU_DFG *dfg) {
     chunks[chunk_id]->copy(host_location, dfg);
@@ -387,6 +360,20 @@ struct Dependence {
         (cudaStream_t *)dfg->get_gpu_stream(chunks[chunk_id]->location),
         chunks[chunk_id]->location);
     chunks[chunk_id]->location = host_location;
+  }
+  void merge_output_off_device(int32_t chunk_id, GPU_DFG *dfg, std::vector<size_t> &cs) {
+    assert(chunks[chunk_id]->location > host_location);
+    size_t data_offset = 0;
+    for (int32_t c = 0; c < chunk_id; ++c)
+      data_offset += cs[c] * host_data.sizes[1] * sizeof(uint64_t);
+    size_t csize = memref_get_data_size(chunks[chunk_id]->host_data);
+    cudaStream_t *s = (cudaStream_t *)dfg->get_gpu_stream(chunks[chunk_id]->location);
+    cuda_memcpy_async_to_cpu(((char *)host_data.aligned) + data_offset,
+			     chunks[chunk_id]->device_data, csize, s, chunks[chunk_id]->location);
+    cuda_drop_async(
+        chunks[chunk_id]->device_data,
+        s,
+        chunks[chunk_id]->location);
   }
   void free_chunk_host_data(int32_t chunk_id, GPU_DFG *dfg) {
     assert(chunks[chunk_id]->location == host_location &&
@@ -645,8 +632,6 @@ struct Stream {
         num_real_inputs++;
         if (s->dep->host_data.sizes[0] > num_samples)
           num_samples = s->dep->host_data.sizes[0];
-        if (!s->dep->chunks.empty())
-          num_samples = s->dep->chunks.size();
       } else {
         mem_per_sample += sizeof(uint64_t);
       }
@@ -713,14 +698,57 @@ struct Stream {
     }
     for (auto o : outputs) {
       if (o->need_new_gen()) {
+	// xxxxxx
+	std::function<uint64_t(Stream *)> get_output_size = [&](Stream *s) -> uint64_t {
+	  uint64_t res = 0;
+	  // If this stream is not produced within SDFG, we could use
+	  // the input size. For now return 0.
+	  if (s->producer == nullptr)
+	    return 0;
+	  // If the producer process has an output size registered,
+	  // return it.
+	  if (s->producer->output_size.val > 0)
+	    return s->producer->output_size.val;
+	  // Finally we look for sizes from inputs to the producer if
+	  // we don't have it registered as poly size does not change
+	  // in operators that do not register size.
+	  for (auto p : s->producer->input_streams) {
+	    uint64_t p_size = get_output_size(p);
+	    if (p_size == 0) continue;
+	    if (res == 0)
+	      res = get_output_size(p);
+	    else
+	      assert(res == p_size);
+	  }
+	  return res;
+        };
+	uint64_t output_size = get_output_size(o);
+	MemRef2 out = {
+	  0, 0, 0, {num_samples, output_size}, {output_size, 1}};
+	std::cout << "new output from process: " << o->producer->name << " output size " << output_size << "\n";
+	size_t data_size = memref_get_data_size(out);
+	out.allocated = out.aligned = (uint64_t *)malloc(data_size);
+
         o->put(new Dependence(split_location,
-                              {nullptr, nullptr, 0, {0, 0}, {0, 0}}, nullptr,
+                              out, nullptr,
                               false, false, split_chunks));
         o->dep->chunks.resize(num_chunks + num_gpu_chunks, nullptr);
       }
     }
-
+    std::vector<size_t> chunking_schedule;
+    for (auto i : inputs) {
+      size_t cdim = (i->ct_stream) ? 0 : 1;
+      if (i->dep->host_data.sizes[cdim] == num_samples) {
+	for (auto c : i->dep->chunks)
+	  chunking_schedule.push_back(c->host_data.sizes[cdim]);
+	break;
+      }
+    }
     // Execute graph
+    std::cout << "Graph has " << queue.size() << " processes :";
+    for (auto p : queue)
+      std::cout << " " << p->name;
+    std::cout << "\n";
     std::list<std::thread> workers;
     std::list<std::thread> gpu_schedulers;
     std::vector<std::list<size_t>> gpu_chunk_list;
@@ -742,7 +770,16 @@ struct Stream {
           workers.push_back(std::thread(
               [&](std::list<Process *> queue, size_t c, int32_t host_location) {
                 for (auto p : queue) {
-                  schedule_kernel(p, host_location, c, nullptr);
+		  Stream *os = p->output_streams[0];
+		  auto it = std::find(outputs.begin(), outputs.end(), os);
+		  if (it == outputs.end()) {
+		    schedule_kernel(p, host_location, c, nullptr);
+		  } else {
+		    size_t data_offset = 0;
+		    for (int32_t ch = 0; ch < c; ++ch)
+		      data_offset += chunking_schedule[ch] * os->dep->host_data.sizes[1] * sizeof(uint64_t);
+		    schedule_kernel(p, host_location, c, (uint64_t *)(((char *)os->dep->host_data.aligned) + data_offset));
+		  }
                 }
                 for (auto iv : intermediate_values)
                   if (iv->consumers.size() == 1)
@@ -773,7 +810,7 @@ struct Stream {
                 else
                   iv->dep->free_chunk_device_data(c, dfg);
               for (auto o : outputs)
-                o->dep->move_chunk_off_device(c, dfg);
+                o->dep->merge_output_off_device(c, dfg, chunking_schedule);
               cudaStreamSynchronize(*(cudaStream_t *)dfg->get_gpu_stream(dev));
             }
           },
@@ -882,6 +919,7 @@ make_process_1_1(void *dfg, void *sin1, void *sout,
   p->dfg->register_stream(s1);
   p->dfg->register_stream(so);
   p->batched_process = s1->batched_stream;
+  p->output_size.val = 0;
   return p;
 }
 
@@ -909,6 +947,7 @@ make_process_2_1(void *dfg, void *sin1, void *sin2, void *sout,
   p->dfg->register_stream(s2);
   p->dfg->register_stream(so);
   p->batched_process = s1->batched_stream;
+  p->output_size.val = 0;
   return p;
 }
 

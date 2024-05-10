@@ -374,6 +374,7 @@ struct Dependence {
         chunks[chunk_id]->device_data,
         s,
         chunks[chunk_id]->location);
+    chunks[chunk_id]->device_data = nullptr;
   }
   void free_chunk_host_data(int32_t chunk_id, GPU_DFG *dfg) {
     assert(chunks[chunk_id]->location == host_location &&
@@ -811,7 +812,7 @@ struct Stream {
                   iv->dep->free_chunk_device_data(c, dfg);
               for (auto o : outputs)
                 o->dep->merge_output_off_device(c, dfg, chunking_schedule);
-              cudaStreamSynchronize(*(cudaStream_t *)dfg->get_gpu_stream(dev));
+              //cudaStreamSynchronize(*(cudaStream_t *)dfg->get_gpu_stream(dev));
             }
           },
           queue, dev));
@@ -828,6 +829,8 @@ struct Stream {
              "Only operations with ciphertext output supported.");
       o->dep->merge_dependence(dfg);
     }
+    for (dev = 0; dev < num_devices; ++dev)
+      cudaStreamSynchronize(*(cudaStream_t *)dfg->get_gpu_stream(dev));
     // We will assume that only one subgraph is being processed per
     // DFG at a time, so we can safely free these here.
     dfg->free_stream_order_dependent_data();

@@ -271,7 +271,8 @@ struct Dependence {
   // Split a dependence into a number of chunks either to run on
   // multiple GPUs or execute concurrently on the host.
   void split_dependence(size_t num_chunks, size_t num_gpu_chunks,
-                        size_t chunk_dim, bool constant) {
+                        size_t chunk_dim, bool constant, size_t gpu_chunk_factor) {
+    std::cout << "Split dep : " << num_chunks << " - " << num_gpu_chunks << " -- num samples: " << host_data.sizes[chunk_dim] << "\n";
     // If this dependence is already split, check that the split
     // matches the new request
     if (chunk_id == split_chunks) {
@@ -306,12 +307,13 @@ struct Dependence {
       return;
     }
     size_t chunk_size =
-        num_samples / (num_chunks + num_gpu_chunks * device_compute_factor);
-    size_t gpu_chunk_size = chunk_size * device_compute_factor;
+        num_samples / (num_chunks + num_gpu_chunks * gpu_chunk_factor);
+    size_t gpu_chunk_size = chunk_size * gpu_chunk_factor;
     chunk_size = (num_samples - gpu_chunk_size * num_gpu_chunks) / num_chunks;
     size_t chunk_remainder =
         (num_samples - gpu_chunk_size * num_gpu_chunks) % num_chunks;
     uint64_t offset = 0;
+    std::cout << "\t chunk sizes : " << chunk_size << " / " << gpu_chunk_size << " - " << chunk_remainder << "\n";
     for (size_t i = 0; i < num_chunks; ++i) {
       size_t chunk_size_ = (i < chunk_remainder) ? chunk_size + 1 : chunk_size;
       MemRef2 m = host_data;
@@ -568,7 +570,7 @@ struct Stream {
     for (auto p : queue) {
       is_batched_subgraph |= p->batched_process;
       subgraph_bootstraps +=
-          (p->fun == memref_bootstrap_lwe_u64_process) ? 1 : 0;
+	(p->fun == memref_bootstrap_lwe_u64_process || p->fun == memref_keyswitch_lwe_u64_process) ? 1 : 0;
     }
     // If this subgraph is not batched, then use this DFG's allocated
     // GPU to offload to.  If this does not bootstrap, just execute on
@@ -643,7 +645,7 @@ struct Stream {
                       (num_real_inputs ? num_real_inputs : 1);
     size_t num_chunks = 1;
     size_t num_gpu_chunks = 0;
-    int32_t num_devices_to_use = 0;
+    size_t gpu_chunk_factor = device_compute_factor;
     // If the subgraph does not have sufficient computational
     // intensity (which we approximate by whether it bootstraps), then
     // we assume (TODO: confirm with profiling) that it is not
@@ -667,20 +669,28 @@ struct Stream {
           (available_mem - const_mem_per_sample) /
           ((mem_per_sample ? mem_per_sample : 1) * gpu_memory_inflation_factor);
 
-      if (num_samples < num_cores + device_compute_factor * num_devices) {
-        num_devices_to_use = 0;
+      while (gpu_chunk_factor > 4) {
+	std::cout << "Factor : " << gpu_chunk_factor << "\n";
+	if (num_samples < num_cores + gpu_chunk_factor * num_devices)
+	  gpu_chunk_factor >>= 1;
+	else
+	  break;
+      }
+      std::cout << "Factor : " << gpu_chunk_factor << "\n";
+
+      if (num_samples < num_cores + gpu_chunk_factor * num_devices) {
         num_chunks = std::min(num_cores, num_samples);
       } else {
-        num_devices_to_use = num_devices;
         size_t compute_resources =
-            num_cores + num_devices * device_compute_factor;
+            num_cores + num_devices * gpu_chunk_factor;
         size_t gpu_chunk_size =
             std::ceil((double)num_samples / compute_resources) *
-            device_compute_factor;
+            gpu_chunk_factor;
         size_t scale_factor =
             std::ceil((double)gpu_chunk_size / max_samples_per_chunk);
         num_chunks = num_cores * scale_factor;
         num_gpu_chunks = num_devices * scale_factor;
+	std::cout << "\t\t samples per chunk : " << max_samples_per_chunk << " " << scale_factor << "\n";
       }
     } else {
       num_chunks = std::min(num_cores, num_samples);
@@ -688,7 +698,7 @@ struct Stream {
 
     for (auto i : inputs)
       i->dep->split_dependence(num_chunks, num_gpu_chunks,
-                               (i->ct_stream) ? 0 : 1, i->const_stream);
+                               (i->ct_stream) ? 0 : 1, i->const_stream, gpu_chunk_factor);
     for (auto iv : intermediate_values) {
       if (iv->need_new_gen()) {
         iv->put(new Dependence(split_location,
@@ -726,7 +736,7 @@ struct Stream {
 	uint64_t output_size = get_output_size(o);
 	MemRef2 out = {
 	  0, 0, 0, {num_samples, output_size}, {output_size, 1}};
-	std::cout << "new output from process: " << o->producer->name << " output size " << output_size << "\n";
+	//std::cout << "new output from process: " << o->producer->name << " output size " << output_size << "\n";
 	size_t data_size = memref_get_data_size(out);
 	out.allocated = out.aligned = (uint64_t *)malloc(data_size);
 

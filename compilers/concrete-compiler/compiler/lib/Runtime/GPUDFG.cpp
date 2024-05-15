@@ -272,7 +272,7 @@ struct Dependence {
   // multiple GPUs or execute concurrently on the host.
   void split_dependence(size_t num_chunks, size_t num_gpu_chunks,
                         size_t chunk_dim, bool constant, size_t gpu_chunk_factor) {
-    std::cout << "Split dep : " << num_chunks << " - " << num_gpu_chunks << " -- num samples: " << host_data.sizes[chunk_dim] << "\n";
+    //std::cout << "Split dep : " << num_chunks << " - " << num_gpu_chunks << " -- num samples: " << host_data.sizes[chunk_dim] << "\n";
     // If this dependence is already split, check that the split
     // matches the new request
     if (chunk_id == split_chunks) {
@@ -313,7 +313,7 @@ struct Dependence {
     size_t chunk_remainder =
         (num_samples - gpu_chunk_size * num_gpu_chunks) % num_chunks;
     uint64_t offset = 0;
-    std::cout << "\t chunk sizes : " << chunk_size << " / " << gpu_chunk_size << " - " << chunk_remainder << "\n";
+    //std::cout << "\t chunk sizes : " << chunk_size << " / " << gpu_chunk_size << " - " << chunk_remainder << "\n";
     for (size_t i = 0; i < num_chunks; ++i) {
       size_t chunk_size_ = (i < chunk_remainder) ? chunk_size + 1 : chunk_size;
       MemRef2 m = host_data;
@@ -670,13 +670,13 @@ struct Stream {
           ((mem_per_sample ? mem_per_sample : 1) * gpu_memory_inflation_factor);
 
       while (gpu_chunk_factor > 4) {
-	std::cout << "Factor : " << gpu_chunk_factor << "\n";
+	//std::cout << "Factor : " << gpu_chunk_factor << "\n";
 	if (num_samples < num_cores + gpu_chunk_factor * num_devices)
 	  gpu_chunk_factor >>= 1;
 	else
 	  break;
       }
-      std::cout << "Factor : " << gpu_chunk_factor << "\n";
+      //std::cout << "Factor : " << gpu_chunk_factor << "\n";
 
       if (num_samples < num_cores + gpu_chunk_factor * num_devices) {
         num_chunks = std::min(num_cores, num_samples);
@@ -690,7 +690,7 @@ struct Stream {
             std::ceil((double)gpu_chunk_size / max_samples_per_chunk);
         num_chunks = num_cores * scale_factor;
         num_gpu_chunks = num_devices * scale_factor;
-	std::cout << "\t\t samples per chunk : " << max_samples_per_chunk << " " << scale_factor << "\n";
+	//std::cout << "\t\t samples per chunk : " << max_samples_per_chunk << " " << scale_factor << "\n";
       }
     } else {
       num_chunks = std::min(num_cores, num_samples);
@@ -756,10 +756,10 @@ struct Stream {
       }
     }
     // Execute graph
-    std::cout << "Graph has " << queue.size() << " processes :";
-    for (auto p : queue)
-      std::cout << " " << p->name;
-    std::cout << "\n";
+    //std::cout << "Graph has " << queue.size() << " processes :";
+    //for (auto p : queue)
+    //std::cout << " " << p->name;
+    //std::cout << "\n";
     std::list<std::thread> workers;
     std::list<std::thread> gpu_schedulers;
     std::vector<std::list<size_t>> gpu_chunk_list;

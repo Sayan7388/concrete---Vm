@@ -31,17 +31,39 @@ static inline int timespec_diff(struct timespec *, const struct timespec *,
     assert(clock_gettime(TIME_UTIL_CLOCK, &_end_time_tv) == 0);                \
     assert(timespec_diff((p), &_end_time_tv, (p)) == 0);                       \
     std::cout << "[NODE \t" << _dfr_debug_get_node_id() << "] \t" << (m)       \
-              << " time : \t" << (p)->tv_sec << "." << (p)->tv_nsec            \
+              << " time : \t" << time_in_seconds((p)) \
               << " seconds.\n"                                                 \
               << std::flush;                                                   \
   } while (0)
+#define END_TIME_C(p, m, c)
+#define END_TIME_C_ACC(p, m, c, acc)
 #else
 #define END_TIME(p, m)                                                         \
   do {                                                                         \
     struct timespec _end_time_tv;                                              \
     assert(clock_gettime(TIME_UTIL_CLOCK, &_end_time_tv) == 0);                \
     assert(timespec_diff((p), &_end_time_tv, (p)) == 0);                       \
-    std::cout << (m) << " time : \t" << (p)->tv_sec << "." << (p)->tv_nsec     \
+    std::cout << (m) << " time : \t" << time_in_seconds((p))     \
+              << " seconds.\n"                                                 \
+              << std::flush;                                                   \
+  } while (0)
+#define END_TIME_C(p, m, c)						\
+  do {                                                                         \
+    struct timespec _end_time_tv;                                              \
+    assert(clock_gettime(TIME_UTIL_CLOCK, &_end_time_tv) == 0);                \
+    assert(timespec_diff((p), &_end_time_tv, (p)) == 0);                       \
+    std::cout << (m) << " [" << (c) << "] time : \t" << time_in_seconds((p)) \
+              << " seconds.\n"                                                 \
+              << std::flush;                                                   \
+  } while (0)
+#define END_TIME_C_ACC(p, m, c, acc)					\
+  do {                                                                         \
+    struct timespec _end_time_tv;                                              \
+    assert(clock_gettime(TIME_UTIL_CLOCK, &_end_time_tv) == 0);                \
+    assert(timespec_diff((p), &_end_time_tv, (p)) == 0);                       \
+    timespec_acc((acc), (p), (acc));					\
+    std::cout << (m) << " [" << (c) << "] time : \t" << time_in_seconds((p)) \
+	      << " (total : " << time_in_seconds((acc)) << " )"		\
               << " seconds.\n"                                                 \
               << std::flush;                                                   \
   } while (0)
@@ -54,6 +76,13 @@ static inline double get_thread_cpu_time(void) {
   assert(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &_tv) == 0);
   _t = _tv.tv_sec;
   _t += _tv.tv_nsec * 1e-9;
+  return _t;
+}
+
+static inline double time_in_seconds(struct timespec *_tv) {
+  double _t;
+  _t = _tv->tv_sec;
+  _t += _tv->tv_nsec * 1e-9;
   return _t;
 }
 
@@ -86,10 +115,22 @@ static inline int timespec_diff(struct timespec *_result,
   return _x.tv_sec < _y.tv_sec;
 }
 
+static inline void timespec_acc(struct timespec *_result,
+                                const struct timespec *_px,
+                                const struct timespec *_py) {
+  struct timespec _x, _y;
+  _x = *_px;
+  _y = *_py;
+  _result->tv_sec = _x.tv_sec + _y.tv_sec;
+  _result->tv_nsec = _x.tv_nsec + _y.tv_nsec;
+}
+
 #else // CONCRETELANG_TIMING_ENABLED
 
 #define BEGIN_TIME(p)
 #define END_TIME(p, m)
+#define END_TIME_C(p, m, c)
+#define END_TIME_C_ACC(p, m, c, acc)
 
 #endif // CONCRETELANG_TIMING_ENABLED
 #endif

@@ -36,7 +36,8 @@ namespace gpu_dfg {
 namespace {
 
 #if CONCRETELANG_TIMING_ENABLED
-  static struct timespec merge_timer, cpu_timer, move_timer;
+  static struct timespec merge_timer, init_timer, blocking_get_timer, put_timer, acc1, acc2, acc3, acc4;
+  int timer_count = 0;
 #endif
 
 using MemRef2 = MemRefDescriptor<2>;
@@ -340,7 +341,7 @@ struct Dependence {
   }
   void merge_dependence(GPU_DFG *dfg) {
     assert(!chunks.empty() && "Cannot merge dependence with no chunks");
-    BEGIN_TIME(&merge_timer);
+    //BEGIN_TIME(&merge_timer);
     assert(host_data.allocated != nullptr);
 
     //for (auto c : chunks)
@@ -353,7 +354,7 @@ struct Dependence {
     assert(device_data == nullptr);
     hostAllocated = true;
     chunk_id = single_chunk;
-    END_TIME(&merge_timer, "Merging :");
+    //END_TIME(&merge_timer, "Merging");
   }
   void move_chunk_off_device(int32_t chunk_id, GPU_DFG *dfg) {
     chunks[chunk_id]->copy(host_location, dfg);
@@ -696,6 +697,10 @@ struct Stream {
       num_chunks = std::min(num_cores, num_samples);
     }
 
+    // TEMP: force all exec on GP
+    //if (num_gpu_chunks > 0)
+    //num_chunks = 0;
+
     for (auto i : inputs)
       i->dep->split_dependence(num_chunks, num_gpu_chunks,
                                (i->ct_stream) ? 0 : 1, i->const_stream, gpu_chunk_factor);
@@ -822,7 +827,7 @@ struct Stream {
                   iv->dep->free_chunk_device_data(c, dfg);
               for (auto o : outputs)
                 o->dep->merge_output_off_device(c, dfg, chunking_schedule);
-              //cudaStreamSynchronize(*(cudaStream_t *)dfg->get_gpu_stream(dev));
+              cudaStreamSynchronize(*(cudaStream_t *)dfg->get_gpu_stream(dev));
             }
           },
           queue, dev));
@@ -1599,6 +1604,8 @@ void stream_emulator_put_memref(void *stream, uint64_t *allocated,
                                 uint64_t *aligned, uint64_t offset,
                                 uint64_t size, uint64_t stride,
 				uint64_t data_ownership = 0) {
+  //END_TIME_C_ACC(&put_timer, "Control thread to next PUT      ", timer_count, &acc3);
+  //BEGIN_TIME(&put_timer);
   assert(stride == 1 && "Strided memrefs not supported");
   Stream *s = (Stream *)stream;
   MemRef2 m = {allocated, aligned, offset, {1, size}, {size, stride}};
@@ -1606,6 +1613,8 @@ void stream_emulator_put_memref(void *stream, uint64_t *allocated,
       new Dependence(host_location, (data_ownership) ? m : memref_copy_alloc(m), nullptr, true, true);
   s->put(dep);
   s->generation++;
+  //END_TIME_C_ACC(&put_timer, "                       PUT      ", timer_count++, &acc4);
+  //BEGIN_TIME(&put_timer);
 }
 void stream_emulator_get_memref(void *stream, uint64_t *out_allocated,
                                 uint64_t *out_aligned, uint64_t out_offset,
@@ -1629,6 +1638,8 @@ void stream_emulator_put_memref_batch(void *stream, uint64_t *allocated,
                                       uint64_t size0, uint64_t size1,
                                       uint64_t stride0, uint64_t stride1,
 				      uint64_t data_ownership = 0) {
+  END_TIME_C_ACC(&put_timer, "Control thread to next PUT batch", data_ownership, &acc3);
+  BEGIN_TIME(&put_timer);
   assert(stride1 == 1 && "Strided memrefs not supported");
   Stream *s = (Stream *)stream;
   MemRef2 m = {allocated, aligned, offset, {size0, size1}, {stride0, stride1}};
@@ -1636,12 +1647,17 @@ void stream_emulator_put_memref_batch(void *stream, uint64_t *allocated,
     new Dependence(host_location, (data_ownership) ? m : memref_copy_alloc(m), nullptr, true, true);
   s->put(dep);
   s->generation++;
+  END_TIME_C_ACC(&put_timer, "                       PUT batch", timer_count++, &acc4);
+  BEGIN_TIME(&put_timer);
 }
 void stream_emulator_get_memref_batch(void *stream, uint64_t *out_allocated,
                                       uint64_t *out_aligned,
                                       uint64_t out_offset, uint64_t out_size0,
                                       uint64_t out_size1, uint64_t out_stride0,
                                       uint64_t out_stride1) {
+  static size_t count = 0;
+  END_TIME_C_ACC(&blocking_get_timer, "Control thread to next blocking GET", count, &acc1);
+  BEGIN_TIME(&blocking_get_timer);
   assert(out_stride1 == 1 && "Strided memrefs not supported");
   MemRef2 mref = {out_allocated,
                   out_aligned,
@@ -1650,9 +1666,12 @@ void stream_emulator_get_memref_batch(void *stream, uint64_t *out_allocated,
                   {out_stride0, out_stride1}};
   auto s = (Stream *)stream;
   s->get_on_host(mref);
+  END_TIME_C_ACC(&blocking_get_timer, "\t\tBlocking GET time", count++, &acc2);
+  BEGIN_TIME(&blocking_get_timer);
 }
 
 void *stream_emulator_init() {
+  BEGIN_TIME(&init_timer);
   int num;
   assert(cudaGetDeviceCount(&num) == cudaSuccess);
   num_devices = num;
@@ -1701,9 +1720,15 @@ void *stream_emulator_init() {
   if (num_cores < 1)
     num_cores = 1;
 
+  END_TIME(&init_timer, "Initialization of the SDFG runtime");
+  BEGIN_TIME(&blocking_get_timer);
+
   int device = next_device.fetch_add(1) % num_devices;
   return new GPU_DFG(device);
 }
-void stream_emulator_run(void *dfg) {}
+void stream_emulator_run(void *dfg) {
+  END_TIME(&blocking_get_timer, "Building the SDFG graph");
+  BEGIN_TIME(&blocking_get_timer);
+}
 void stream_emulator_delete(void *dfg) { delete (GPU_DFG *)dfg; }
 #endif

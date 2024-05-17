@@ -12,6 +12,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Dialect.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Operation.h"
 
 #include <concretelang/Dialect/SDFG/Transforms/Passes.h>
@@ -66,13 +67,13 @@ struct SDFGBufferOwnershipPass
     // ownership of the buffer instead, removing the deallocation and
     // allowing the runtime to deallocate when appropriate.
     module.walk([&](mlir::memref::DeallocOp op) {
+      PostDominanceInfo postDomInfo(op);
+      DominanceInfo domInfo(op);
       Value alloc = op.getOperand();
       DenseSet<OpOperand *> aliasedUses;
       getAliasedUses(alloc, aliasedUses);
 
       // Check if this memref is used in a SDFG put operation
-      bool isCandidate = false;
-      mlir::func::CallOp putOp;
       for (auto use : aliasedUses) {
         if (isa<mlir::func::CallOp>(
                 use->getOwner())) {
@@ -80,26 +81,22 @@ struct SDFGBufferOwnershipPass
 	  mlir::func::FuncOp funcOp = getCalledFunction(callOp);
 	  std::string putName = "stream_emulator_put_memref";
 	  if (funcOp.getName().str().compare(0, putName.size(), putName) == 0) {
-	    isCandidate = true;
-	    putOp = callOp;
-	    continue;
+	    // If the put operation dominates the deallocation, then
+	    // ownership of the data can be transferred to the runtime
+	    // and deallocation can be removed. We mark the ownership
+	    // flag in the PUT operation to notify the runtime that it
+	    // gets ownership.
+	    if (domInfo.properlyDominates(callOp, op)) {
+	      	deallocOps.push_back(op);
+		OpBuilder builder(callOp);
+		mlir::Value cst1 = builder.create<mlir::arith::ConstantOp>(
+									   callOp.getLoc(),
+									   builder.getI64IntegerAttr(1));
+		callOp->setOperand(2, cst1);
+	    }
+	    return;
 	  }
         }
-	if (isa<mlir::memref::DeallocOp, mlir::memref::StoreOp, mlir::memref::CastOp>(use->getOwner()))
-	  continue;
-	isCandidate = false;
-	break;
-      }
-      // If the memref deallocated in this op is only used in the SDFG
-      // Put operation, we'll remove the deallocation and notify the
-      // runtime that it can take ownership.
-      if (isCandidate) {
-	deallocOps.push_back(op);
-	OpBuilder builder(putOp);
-	mlir::Value cst1 = builder.create<mlir::arith::ConstantOp>(
-          putOp.getLoc(),
-	  builder.getI64IntegerAttr(1));
-	putOp->setOperand(2, cst1);
       }
     });
 

@@ -356,8 +356,13 @@ struct Dependence {
     chunk_id = single_chunk;
     //END_TIME(&merge_timer, "Merging");
   }
+  void copy_chunk_off_device(int32_t chunk_id, GPU_DFG *dfg) {
+    if (chunks[chunk_id]->onHostReady)
+      return;
+    chunks[chunk_id]->copy(host_location, dfg, false);
+  }
   void move_chunk_off_device(int32_t chunk_id, GPU_DFG *dfg) {
-    chunks[chunk_id]->copy(host_location, dfg);
+    copy_chunk_off_device(chunk_id, dfg);
     cuda_drop_async(
         chunks[chunk_id]->device_data,
         (cudaStream_t *)dfg->get_gpu_stream(chunks[chunk_id]->location),
@@ -373,11 +378,6 @@ struct Dependence {
     cudaStream_t *s = (cudaStream_t *)dfg->get_gpu_stream(chunks[chunk_id]->location);
     cuda_memcpy_async_to_cpu(((char *)host_data.aligned) + data_offset,
 			     chunks[chunk_id]->device_data, csize, s, chunks[chunk_id]->location);
-    cuda_drop_async(
-        chunks[chunk_id]->device_data,
-        s,
-        chunks[chunk_id]->location);
-    chunks[chunk_id]->device_data = nullptr;
   }
   void free_chunk_host_data(int32_t chunk_id, GPU_DFG *dfg) {
     assert(chunks[chunk_id]->location == host_location &&
@@ -415,7 +415,7 @@ struct Dependence {
     chunks.clear();
     delete (this);
   }
-  inline void copy(int32_t loc, GPU_DFG *dfg) {
+  inline void copy(int32_t loc, GPU_DFG *dfg, bool synchronize = true) {
     size_t data_size = memref_get_data_size(host_data);
     if (loc == location)
       return;
@@ -429,7 +429,8 @@ struct Dependence {
       cudaStream_t *s = (cudaStream_t *)dfg->get_gpu_stream(location);
       cuda_memcpy_async_to_cpu(host_data.aligned, device_data, data_size, s,
                                location);
-      cudaStreamSynchronize(*s);
+      if (synchronize)
+	cudaStreamSynchronize(*s);
       onHostReady = true;
     } else {
       assert(onHostReady &&
@@ -697,10 +698,6 @@ struct Stream {
       num_chunks = std::min(num_cores, num_samples);
     }
 
-    // TEMP: force all exec on GP
-    //if (num_gpu_chunks > 0)
-    //num_chunks = 0;
-
     for (auto i : inputs)
       i->dep->split_dependence(num_chunks, num_gpu_chunks,
                                (i->ct_stream) ? 0 : 1, i->const_stream, gpu_chunk_factor);
@@ -713,43 +710,46 @@ struct Stream {
       }
     }
     for (auto o : outputs) {
-      if (o->need_new_gen()) {
-	// xxxxxx
-	std::function<uint64_t(Stream *)> get_output_size = [&](Stream *s) -> uint64_t {
-	  uint64_t res = 0;
-	  // If this stream is not produced within SDFG, we could use
-	  // the input size. For now return 0.
-	  if (s->producer == nullptr)
-	    return 0;
-	  // If the producer process has an output size registered,
-	  // return it.
-	  if (s->producer->output_size.val > 0)
-	    return s->producer->output_size.val;
-	  // Finally we look for sizes from inputs to the producer if
-	  // we don't have it registered as poly size does not change
-	  // in operators that do not register size.
-	  for (auto p : s->producer->input_streams) {
-	    uint64_t p_size = get_output_size(p);
-	    if (p_size == 0) continue;
-	    if (res == 0)
-	      res = get_output_size(p);
-	    else
-	      assert(res == p_size);
-	  }
-	  return res;
-        };
+      assert (o->need_new_gen());
+      // xxxxxx
+      std::function<uint64_t(Stream *)> get_output_size = [&](Stream *s) -> uint64_t {
+	uint64_t res = 0;
+	// If this stream is not produced within SDFG, we could use
+	// the input size. For now return 0.
+	if (s->producer == nullptr)
+	  return 0;
+	// If the producer process has an output size registered,
+	// return it.
+	if (s->producer->output_size.val > 0)
+	  return s->producer->output_size.val;
+	// Finally we look for sizes from inputs to the producer if
+	// we don't have it registered as poly size does not change
+	// in operators that do not register size.
+	for (auto p : s->producer->input_streams) {
+	  uint64_t p_size = get_output_size(p);
+	  if (p_size == 0) continue;
+	  if (res == 0)
+	    res = get_output_size(p);
+	  else
+	    assert(res == p_size);
+	}
+	return res;
+      };
+      MemRef2 out_mref;
+      if (o == this) {
+	out_mref = out;
+      } else {
 	uint64_t output_size = get_output_size(o);
-	MemRef2 out = {
+	out_mref = {
 	  0, 0, 0, {num_samples, output_size}, {output_size, 1}};
-	//std::cout << "new output from process: " << o->producer->name << " output size " << output_size << "\n";
-	size_t data_size = memref_get_data_size(out);
-	out.allocated = out.aligned = (uint64_t *)malloc(data_size);
-
-        o->put(new Dependence(split_location,
-                              out, nullptr,
-                              false, false, split_chunks));
-        o->dep->chunks.resize(num_chunks + num_gpu_chunks, nullptr);
+	size_t data_size = memref_get_data_size(out_mref);
+	out_mref.allocated = out_mref.aligned = (uint64_t *)malloc(data_size);
       }
+
+      o->put(new Dependence(split_location,
+			    out_mref, nullptr,
+			    false, false, split_chunks));
+      o->dep->chunks.resize(num_chunks + num_gpu_chunks, nullptr);
     }
     std::vector<size_t> chunking_schedule;
     for (auto i : inputs) {
@@ -761,16 +761,16 @@ struct Stream {
       }
     }
     // Execute graph
-    //std::cout << "Graph has " << queue.size() << " processes :";
-    //for (auto p : queue)
-    //std::cout << " " << p->name;
-    //std::cout << "\n";
+    std::cout << "Graph has " << queue.size() << " processes :";
+    for (auto p : queue)
+      std::cout << " " << p->name;
+    std::cout << "\n";
     std::list<std::thread> workers;
     std::list<std::thread> gpu_schedulers;
     std::vector<std::list<size_t>> gpu_chunk_list;
     gpu_chunk_list.resize(num_devices);
     int32_t dev = 0;
-    for (size_t c = 0; c < num_chunks + num_gpu_chunks; ++c) {
+    for (int c = num_chunks + num_gpu_chunks - 1; c >= 0 ; --c) {
       if (!subgraph_bootstraps) {
         workers.push_back(std::thread(
             [&](std::list<Process *> queue, size_t c, int32_t host_location) {
@@ -818,15 +818,29 @@ struct Stream {
               assert(status == cudaSuccess);
               cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
               assert(status == cudaSuccess);
-              for (auto p : queue)
+              for (auto p : queue) {
                 schedule_kernel(p, dev, c, nullptr);
+		for (auto out_str : p->output_streams) {
+		  // For all output streams, if this is an output,
+		  // schedule copy out of the data produced by this
+		  // process.
+		  if (auto it = std::find(outputs.begin(), outputs.end(), out_str); it != outputs.end()) {
+		    out_str->dep->merge_output_off_device(c, dfg, chunking_schedule);
+		    //out_str->dep->copy_chunk_off_device(c, dfg);
+		    continue;
+		  }
+		  // If this is not an output, but some process is not
+		  // part of this subgraph, we need to copy the data
+		  // out.
+		  for (auto cons_proc : out_str->consumers)
+		    if (auto it = std::find(queue.begin(), queue.end(), cons_proc); it == queue.end())
+		      out_str->dep->copy_chunk_off_device(c, dfg);
+		}
+	      }
               for (auto iv : intermediate_values)
-                if (iv->consumers.size() > 1)
-                  iv->dep->move_chunk_off_device(c, dfg);
-                else
-                  iv->dep->free_chunk_device_data(c, dfg);
+		iv->dep->free_chunk_device_data(c, dfg);
               for (auto o : outputs)
-                o->dep->merge_output_off_device(c, dfg, chunking_schedule);
+		o->dep->free_chunk_device_data(c, dfg);
               cudaStreamSynchronize(*(cudaStream_t *)dfg->get_gpu_stream(dev));
             }
           },
@@ -852,11 +866,16 @@ struct Stream {
     return;
   }
   Dependence *get_on_host(MemRef2 &out) {
+    //BEGIN_TIME(&merge_timer);
     schedule_work(out);
+    //END_TIME(&merge_timer, "\t\t -- Sched work");
+    //BEGIN_TIME(&merge_timer);
     assert(dep != nullptr && "GET on empty stream not allowed.");
     // If this was already copied to host, copy out
     if (dep->onHostReady) {
-      memref_copy_contiguous(out, dep->host_data);
+      assert(out.aligned == dep->host_data.aligned);
+      //memref_copy_contiguous(out, dep->host_data);
+      //END_TIME(&merge_timer, "\t\t -- GoH remainder (ohr)");
       return dep;
     } else if (dep->location == split_location) {
       char *pos = (char *)(out.aligned + out.offset);
@@ -889,6 +908,7 @@ struct Stream {
       dep->host_data = memref_copy_alloc(out);
     dep->onHostReady = true;
     dep->hostAllocated = true;
+    //END_TIME(&merge_timer, "\t\t -- GoH remainder (nohr)");
     return dep;
   }
   Dependence *get(int32_t location, int32_t chunk_id = single_chunk) {
@@ -1173,7 +1193,7 @@ void memref_bootstrap_lwe_u64_process(Process *p, int32_t loc, int32_t chunk_id,
 
   cudaStream_t *cstream = (cudaStream_t *)p->dfg->get_gpu_stream(loc);
   Dependence *idep0 = p->input_streams[0]->get(loc, chunk_id);
-  //if (p->output_streams[0]->need_new_gen(chunk_id))
+  if (p->output_streams[0]->need_new_gen(chunk_id))
     p->output_streams[0]->put(
         sched(idep0, idep1, glwe_ct, lut_indexes, cstream, loc), chunk_id);
 }
@@ -1638,8 +1658,8 @@ void stream_emulator_put_memref_batch(void *stream, uint64_t *allocated,
                                       uint64_t size0, uint64_t size1,
                                       uint64_t stride0, uint64_t stride1,
 				      uint64_t data_ownership = 0) {
-  END_TIME_C_ACC(&put_timer, "Control thread to next PUT batch", data_ownership, &acc3);
-  BEGIN_TIME(&put_timer);
+  //END_TIME_C_ACC(&put_timer, "Control thread to next PUT batch", data_ownership, &acc3);
+  //BEGIN_TIME(&put_timer);
   assert(stride1 == 1 && "Strided memrefs not supported");
   Stream *s = (Stream *)stream;
   MemRef2 m = {allocated, aligned, offset, {size0, size1}, {stride0, stride1}};
@@ -1647,8 +1667,8 @@ void stream_emulator_put_memref_batch(void *stream, uint64_t *allocated,
     new Dependence(host_location, (data_ownership) ? m : memref_copy_alloc(m), nullptr, true, true);
   s->put(dep);
   s->generation++;
-  END_TIME_C_ACC(&put_timer, "                       PUT batch", timer_count++, &acc4);
-  BEGIN_TIME(&put_timer);
+  //END_TIME_C_ACC(&put_timer, "                       PUT batch", timer_count++, &acc4);
+  //BEGIN_TIME(&put_timer);
 }
 void stream_emulator_get_memref_batch(void *stream, uint64_t *out_allocated,
                                       uint64_t *out_aligned,

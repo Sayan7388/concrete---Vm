@@ -137,7 +137,7 @@ struct CompilationOptions {
     case Backend::GPU:
       loopParallelize = true;
       batchTFHEOps = true;
-      emitGPUOps = true;
+      emitGPUOps = false;
       emitSDFGOps = true;
       char *env = getenv("SDFG_MAX_BATCH_SIZE");
       if (env != nullptr) {

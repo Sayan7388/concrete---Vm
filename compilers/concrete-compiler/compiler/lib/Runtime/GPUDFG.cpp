@@ -863,6 +863,7 @@ struct Stream {
     // We will assume that only one subgraph is being processed per
     // DFG at a time, so we can safely free these here.
     dfg->free_stream_order_dependent_data();
+    std::cout << "Subraph exec done\n";
     return;
   }
   Dependence *get_on_host(MemRef2 &out) {

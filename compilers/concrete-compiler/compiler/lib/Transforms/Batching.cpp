@@ -725,6 +725,8 @@ mlir::Value hoistIndexedOp(
       strides.push_back(rewriter.getIndexAttr(stride));
       ivIndexedDims.push_back(false);
     } else {
+      llvm::errs() << "outermost " << outermostFor << "\n"
+		   << "\t affine " << isAffine << " " << size << " " << stride << "\n";
       llvm_unreachable("Unknown type of index found");
     }
   }
@@ -1063,6 +1065,7 @@ public:
           return false;
         };
         return hasKSorBS(forOp) && isStaticLoop(forOp);
+        //return isStaticLoop(forOp);
       };
 
       // Only batchable operations within at least one loop are of

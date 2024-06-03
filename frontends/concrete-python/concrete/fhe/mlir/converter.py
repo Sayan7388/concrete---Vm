@@ -18,6 +18,7 @@ from mlir.ir import InsertionPoint as MlirInsertionPoint
 from mlir.ir import Location as MlirLocation
 from mlir.ir import Module as MlirModule
 
+from .. import tfhers
 from ..compilation.configuration import Configuration, Exactness
 from ..representation import Graph, GraphProcessor, MultiGraphProcessor, Node, Operation
 from .context import Context
@@ -848,7 +849,7 @@ class Converter:
     def tfhers_to_native(self, ctx: Context, node: Node, preds: List[Conversion]) -> Conversion:
         assert len(preds) == 1
         tfhers_int = preds[0]
-        dtype = node.properties["attributes"]["type"]
+        dtype: tfhers.TFHERSIntegerType = node.properties["attributes"]["type"]
         result_bit_width, carry_width, msg_width = (
             dtype.bit_width,
             dtype.carry_width,
@@ -856,7 +857,7 @@ class Converter:
         )
 
         # TODO: use parameters to change partition
-        tfhers_int = ctx.change_partition(tfhers_int)
+        tfhers_int = ctx.change_partition(tfhers_int, src_partition=dtype.params)
 
         # number of ciphertexts representing a single integer
         num_cts = tfhers_int.shape[-1]
@@ -882,7 +883,7 @@ class Converter:
 
     def tfhers_from_native(self, ctx: Context, node: Node, preds: List[Conversion]) -> Conversion:
         assert len(preds) == 1
-        dtype = node.properties["attributes"]["type"]
+        dtype: tfhers.TFHERSIntegerType = node.properties["attributes"]["type"]
         input_bit_width, carry_width, msg_width = (
             dtype.bit_width,
             dtype.carry_width,
@@ -943,6 +944,6 @@ class Converter:
         # we are extracting lsb first so we reverse it so we have msb first
         result = ctx.concatenate(result_type, extracted_bits[::-1], axis=-1)
         # TODO: use specified parameters
-        return ctx.change_partition(result)
+        return ctx.change_partition(result, dest_partition=dtype.params)
 
     # pylint: enable=missing-function-docstring,unused-argument
